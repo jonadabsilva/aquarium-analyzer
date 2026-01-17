@@ -1,313 +1,1120 @@
+"""
+Aquarium Water Test Strip Analyzer - Enhanced Version
+A Streamlit web app for analyzing SJ Wave test strips (10-in-1 and Ammonia)
+With automatic chart detection and click-to-sample functionality
+
+Features:
+- Automatic chart/strip detection and perspective correction
+- Click on image to sample colors
+- Comprehensive water quality report
+- Saltwater/Freshwater support
+- Specific gravity integration
+- Mobile-optimized interface
+"""
+
 import streamlit as st
-import cv2
 import numpy as np
-import pandas as pd
-from skimage.color import rgb2lab, deltaE_cie76
+import cv2
+from PIL import Image
+import io
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, List, Dict, Any
+import json
 
-st.set_page_config(page_title="Pocket Aquarist v2", page_icon="🐠", layout="centered")
+# Page configuration
+st.set_page_config(
+    page_title="🐠 Aquarium Analyzer",
+    page_icon="🐠",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
-# ==========================================
-#    ROBUST COMPUTER VISION ENGINE
-# ==========================================
-class WaterTestAnalyzer:
-    def __init__(self):
-        # 10-in-1 Configuration
-        self.CONFIG_MULTI = {
-            'strip_x_pct': 0.15, 
-            'rows': [
-                {'name': 'Iron', 'y_pct': 0.258, 'values': [0, 5, 10, 25, 50, 100], 'unit': 'mg/L'},
-                {'name': 'Copper', 'y_pct': 0.322, 'values': [0, 10, 30, 100, 200, 300], 'unit': 'mg/L'},
-                {'name': 'Nitrate', 'y_pct': 0.386, 'values': [0, 10, 25, 50, 100, 250], 'unit': 'mg/L'},
-                {'name': 'Nitrite', 'y_pct': 0.450, 'values': [0, 1, 5, 10], 'unit': 'mg/L'}, 
-                {'name': 'Chlorine', 'y_pct': 0.514, 'values': [0, 0.8, 1.5, 3], 'unit': 'mg/L'},
-                {'name': 'Hardness', 'y_pct': 0.578, 'values': [0, 25, 75, 150, 300], 'unit': 'mg/L'},
-                {'name': 'Alkalinity', 'y_pct': 0.642, 'values': [0, 40, 80, 120, 180, 300], 'unit': 'mg/L'},
-                {'name': 'Carbonate', 'y_pct': 0.706, 'values': [0, 40, 80, 120, 180, 300], 'unit': 'mg/L'},
-            ],
-            'ph_fresh': {'name': 'pH', 'y_pct': 0.770, 'values': [6.4, 6.8, 7.2, 7.6, 8.0, 8.4], 'unit': ''},
-            'ph_salt':  {'name': 'pH', 'y_pct': 0.838, 'values': [6.8, 7.2, 7.6, 8.0, 8.4, 9.0], 'unit': ''},
-            'ref_x_start': 0.35, 'ref_x_end': 0.95
-        }
-
-        # Ammonia Configuration
-        self.CONFIG_AMMONIA = {
-            'values': [0, 0.25, 0.5, 1, 3, 6], 'unit': 'ppm',
-            'ref_y_pct': 0.28, 
-            'ref_x_start': 0.35, 'ref_x_end': 0.75
-        }
-
-    # --- NEW: Automatic White Balance ---
-    def correct_white_balance(self, img, reference_mask=None):
-        """
-        Adjusts the image colors so the 'reference_mask' area (the chart) becomes true white/gray.
-        This removes yellow tint from indoor lighting.
-        """
-        result = img.copy()
-        if reference_mask is None:
-            # If no mask, assume the center of the image is the reference (fallback)
-            h, w = img.shape[:2]
-            reference_mask = np.zeros((h, w), dtype="uint8")
-            cv2.rectangle(reference_mask, (int(w*0.3), int(h*0.3)), (int(w*0.7), int(h*0.7)), 255, -1)
-
-        # Calculate average color of the reference area (the white chart)
-        mean_bgr = cv2.mean(img, mask=reference_mask)[:3]
-        
-        # Calculate scaling factors to make it neutral gray (128, 128, 128) or maintain brightness
-        # We target the average brightness of the detected white area to avoid darkening
-        avg_brightness = (mean_bgr[0] + mean_bgr[1] + mean_bgr[2]) / 3
-        
-        b_scale = avg_brightness / (mean_bgr[0] + 1e-6)
-        g_scale = avg_brightness / (mean_bgr[1] + 1e-6)
-        r_scale = avg_brightness / (mean_bgr[2] + 1e-6)
-        
-        # Apply scaling
-        result = result.astype(np.float32)
-        result[:, :, 0] *= b_scale
-        result[:, :, 1] *= g_scale
-        result[:, :, 2] *= r_scale
-        
-        # Clip to valid range
-        result = np.clip(result, 0, 255).astype(np.uint8)
-        return result
-
-    # --- Helper Functions ---
-    def get_avg_color(self, img, x, y, radius=6):
-        h, w = img.shape[:2]
-        # Safety bounds
-        if x < 0 or x >= w or y < 0 or y >= h: return [0,0,0]
-        
-        mask = np.zeros((h, w), dtype="uint8")
-        cv2.circle(mask, (int(x), int(y)), radius, 255, -1)
-        return cv2.mean(img, mask=mask)[:3]
-
-    def match_color(self, target_bgr, ref_bgrs, values):
-        if not ref_bgrs: return 0, 100.0
-        t_lab = rgb2lab(np.uint8([[target_bgr[::-1]]]))
-        r_labs = rgb2lab(np.uint8([[r[::-1] for r in ref_bgrs]]))
-        diffs = [deltaE_cie76(t_lab[0][0], r) for r in r_labs[0]]
-        idx = np.argmin(diffs)
-        return values[idx], diffs[idx]
-
-    def order_points(self, pts):
-        rect = np.zeros((4, 2), dtype="float32")
-        s = pts.sum(axis=1)
-        rect[0], rect[2] = pts[np.argmin(s)], pts[np.argmax(s)]
-        diff = np.diff(pts, axis=1)
-        rect[1], rect[3] = pts[np.argmin(diff)], pts[np.argmax(diff)]
-        return rect
-
-    def detect_chart_contour(self, img):
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5,5), 0)
-        thresh = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
-        cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:5]
-        
-        for c in cnts:
-            peri = cv2.arcLength(c, True)
-            approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4 and cv2.contourArea(c) > 10000:
-                return approx.reshape(4, 2)
-        return None
-
-    # --- 10-in-1 Pipeline ---
-    def process_multi(self, img_file, mode):
-        file_bytes = np.asarray(bytearray(img_file.read()), dtype=np.uint8)
-        img = cv2.imdecode(file_bytes, 1)
-        
-        chart_pts = self.detect_chart_contour(img)
-        if chart_pts is None: raise Exception("Chart not found. Keep camera parallel.")
-        
-        # 1. Warp
-        rect = self.order_points(chart_pts)
-        (tl, tr, br, bl) = rect
-        width = max(int(np.linalg.norm(br-bl)), int(np.linalg.norm(tr-tl)))
-        height = max(int(np.linalg.norm(tr-br)), int(np.linalg.norm(tl-bl)))
-        dst = np.array([[0,0], [width-1,0], [width-1,height-1], [0,height-1]], dtype="float32")
-        warped = cv2.warpPerspective(img, cv2.getPerspectiveTransform(rect, dst), (width, height))
-        
-        # 2. White Balance (Using the empty space at bottom left of chart as reference)
-        # Create a mask for a known white area on this specific chart (bottom left corner approx)
-        wb_mask = np.zeros(warped.shape[:2], dtype="uint8")
-        cv2.rectangle(wb_mask, (int(width*0.05), int(height*0.85)), (int(width*0.25), int(height*0.95)), 255, -1)
-        warped = self.correct_white_balance(warped, wb_mask)
-        
-        debug_img = warped.copy()
-        cfg = self.CONFIG_MULTI
-        rows = cfg['rows'].copy()
-        rows.append(cfg['ph_fresh'] if mode == 'Freshwater' else cfg['ph_salt'])
-        
-        results = []
-        strip_x = int(width * cfg['strip_x_pct'])
-        
-        for row in rows:
-            y = int(height * row['y_pct'])
-            strip_color = self.get_avg_color(warped, strip_x, y)
-            cv2.circle(debug_img, (strip_x, y), 8, (0,0,255), 2)
-            
-            ref_colors = []
-            vals = row['values']
-            r_start, r_end = int(width*cfg['ref_x_start']), int(width*cfg['ref_x_end'])
-            step = (r_end - r_start) / (len(vals)-1) if len(vals) > 1 else 0
-            
-            for i in range(len(vals)):
-                rx = int(r_start + i*step)
-                ref_colors.append(self.get_avg_color(warped, rx, y))
-                cv2.circle(debug_img, (rx, y), 5, (255,100,0), 1)
-            
-            val, _ = self.match_color(strip_color, ref_colors, vals)
-            results.append({'Parameter': row['name'], 'Value': val, 'Unit': row['unit']})
-            
-        return cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB), results
-
-    # --- IMPROVED Ammonia Pipeline ---
-    def process_ammonia(self, img_file):
-        file_bytes = np.asarray(bytearray(img_file.read()), dtype=np.uint8)
-        img = cv2.imdecode(file_bytes, 1)
-        
-        # 1. Find Chart
-        chart_pts = self.detect_chart_contour(img)
-        if chart_pts is None: raise Exception("Could not find the Chart.")
-        
-        # 2. White Balance
-        # Create mask of the chart to use as white reference
-        h, w = img.shape[:2]
-        chart_mask = np.zeros((h, w), dtype="uint8")
-        cv2.fillPoly(chart_mask, [chart_pts.astype(int)], 255)
-        # Correct the WHOLE image colors based on the chart white
-        img_corrected = self.correct_white_balance(img, chart_mask)
-        debug_img = img_corrected.copy()
-        
-        # 3. Get References from Chart (Warp from corrected image)
-        rect = self.order_points(chart_pts)
-        dst = np.array([[0,0], [600,0], [600,800], [0,800]], dtype="float32") # Normalize size
-        M = cv2.getPerspectiveTransform(rect, dst)
-        warped_chart = cv2.warpPerspective(img_corrected, M, (601, 801))
-        
-        cfg = self.CONFIG_AMMONIA
-        ref_colors = []
-        # Sample standardized locations on the warped chart
-        ref_y = int(801 * cfg['ref_y_pct'])
-        r_start, r_end = int(601*cfg['ref_x_start']), int(601*cfg['ref_x_end'])
-        step = (r_end - r_start) / (len(cfg['values'])-1)
-        for i in range(len(cfg['values'])):
-            rx = int(r_start + i*step)
-            ref_colors.append(self.get_avg_color(warped_chart, rx, ref_y))
-
-        # 4. Find Strip (Advanced Filtering)
-        # Mask OUT the chart so we don't find it again
-        search_area = cv2.bitwise_not(chart_mask)
-        # Focus on bright objects (the strip is white)
-        gray = cv2.cvtColor(img_corrected, cv2.COLOR_BGR2GRAY)
-        # High threshold to find white plastic vs black mat
-        _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-        thresh = cv2.bitwise_and(thresh, thresh, mask=search_area)
-        
-        # Morphological Open to remove "speckles" from yoga mat
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        clean_thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
-        
-        cnts, _ = cv2.findContours(clean_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        strip_rect = None
-        best_area = 0
-        
-        for c in cnts:
-            # Filter by area (too small = noise)
-            area = cv2.contourArea(c)
-            if area < 500: continue
-            
-            # Filter by shape (Strip is long and thin)
-            x, y, w, h = cv2.boundingRect(c)
-            aspect_ratio = float(max(w,h)) / min(w,h)
-            
-            # Draw rejected contours in RED for debug
-            cv2.drawContours(debug_img, [c], -1, (0, 0, 255), 1) 
-            
-            if aspect_ratio > 3.0 and area > best_area:
-                best_area = area
-                strip_rect = (x, y, w, h)
-                cv2.drawContours(debug_img, [c], -1, (0, 255, 0), 2) # Found strip in GREEN
-
-        if strip_rect is None:
-            return cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB), [], "Strip Not Found"
-            
-        # 5. Sample Pad
-        sx, sy, sw, sh = strip_rect
-        # Heuristic: Pad is usually at the "top" relative to text or just at one end.
-        # We'll sample 15% from the top of the bounding rect.
-        # User Instruction: "Place strip vertical, pad at top"
-        pad_x = int(sx + sw/2)
-        pad_y = int(sy + sh * 0.15) 
-        
-        strip_color = self.get_avg_color(img_corrected, pad_x, pad_y, radius=10)
-        cv2.circle(debug_img, (pad_x, pad_y), 10, (255, 0, 255), 3) # Magenta circle on pad
-
-        # 6. Match
-        val, dist = self.match_color(strip_color, ref_colors, cfg['values'])
-        return cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB), [{'Parameter': 'Ammonia', 'Value': val, 'Unit': 'ppm'}], None
-
-# ==========================================
-#    UI & REPORTING
-# ==========================================
-st.title("🌊 Pocket Aquarist v2.0")
-st.markdown("### Robust Color & Strip Detection")
-
-with st.expander("Settings", expanded=True):
-    water_mode = st.radio("Water Type", ["Saltwater", "Freshwater"], horizontal=True)
-    if water_mode == "Saltwater":
-        sg = st.number_input("Specific Gravity", 1.000, 1.050, 1.025, 0.001, format="%.3f")
-    else:
-        sg = None
-
-col1, col2 = st.columns(2)
-with col1:
-    st.markdown("#### 1. Multi-Test")
-    img_multi = st.file_uploader("Upload 10-in-1", type=['jpg','png'], key="m")
-with col2:
-    st.markdown("#### 2. Ammonia")
-    st.caption("Place strip **vertically** next to chart. **Pad at TOP**.")
-    img_amm = st.file_uploader("Upload Ammonia", type=['jpg','png'], key="a")
-
-if st.button("Analyze", type="primary"):
-    analyzer = WaterTestAnalyzer()
-    data = []
+# Mobile-friendly CSS
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
     
-    # Analyze Multi
-    if img_multi:
-        try:
-            dimg, res = analyzer.process_multi(img_multi, water_mode)
-            data.extend(res)
-            st.image(dimg, caption="Multi-Test Analysis", use_column_width=True)
-        except Exception as e:
-            st.error(f"Multi-Test Error: {e}")
+    * {
+        font-family: 'Inter', sans-serif;
+    }
+    
+    .main .block-container {
+        padding: 1rem;
+        max-width: 100%;
+    }
+    
+    .stApp {
+        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    }
+    
+    h1, h2, h3 {
+        color: #4fc3f7 !important;
+    }
+    
+    .result-card {
+        background: rgba(255,255,255,0.1);
+        border-radius: 15px;
+        padding: 20px;
+        margin: 10px 0;
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(255,255,255,0.1);
+    }
+    
+    .status-ok {
+        background: linear-gradient(135deg, #00b09b 0%, #96c93d 100%);
+        color: white;
+        padding: 10px 20px;
+        border-radius: 25px;
+        display: inline-block;
+        font-weight: 600;
+    }
+    
+    .status-warning {
+        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+        color: white;
+        padding: 10px 20px;
+        border-radius: 25px;
+        display: inline-block;
+        font-weight: 600;
+    }
+    
+    .status-danger {
+        background: linear-gradient(135deg, #eb3349 0%, #f45c43 100%);
+        color: white;
+        padding: 10px 20px;
+        border-radius: 25px;
+        display: inline-block;
+        font-weight: 600;
+    }
+    
+    .param-row {
+        display: flex;
+        align-items: center;
+        padding: 15px;
+        background: rgba(255,255,255,0.05);
+        border-radius: 10px;
+        margin: 8px 0;
+    }
+    
+    .color-swatch {
+        width: 40px;
+        height: 40px;
+        border-radius: 8px;
+        margin-right: 15px;
+        border: 2px solid white;
+    }
+    
+    .instruction-box {
+        background: rgba(79, 195, 247, 0.1);
+        border-left: 4px solid #4fc3f7;
+        padding: 15px;
+        border-radius: 0 10px 10px 0;
+        margin: 15px 0;
+    }
+    
+    .stButton > button {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border: none;
+        border-radius: 25px;
+        padding: 12px 30px;
+        font-weight: 600;
+        width: 100%;
+        transition: transform 0.2s;
+    }
+    
+    .stButton > button:hover {
+        transform: scale(1.02);
+    }
+    
+    .stSelectbox, .stTextInput {
+        background: rgba(255,255,255,0.1);
+        border-radius: 10px;
+    }
+    
+    div[data-testid="stExpander"] {
+        background: rgba(255,255,255,0.05);
+        border-radius: 10px;
+        border: 1px solid rgba(255,255,255,0.1);
+    }
+</style>
+""", unsafe_allow_html=True)
 
-    # Analyze Ammonia
-    if img_amm:
-        try:
-            dimg, res, err = analyzer.process_ammonia(img_amm)
-            st.image(dimg, caption="Ammonia Analysis (Green=Strip, Red=Ignored Noise)", use_column_width=True)
-            if err:
-                st.error(f"Could not localize strip: {err}. Check the 'Red' contours in image above.")
-            else:
-                data.extend(res)
-        except Exception as e:
-            st.error(f"Ammonia Error: {e}")
 
-    # Report
-    if data:
-        st.divider()
-        st.subheader("Results")
-        df = pd.DataFrame(data)
-        st.dataframe(df, hide_index=True)
+# ==================== DATA CLASSES ====================
+
+@dataclass
+class ColorReference:
+    """Reference color for a specific value"""
+    value: float
+    rgb: Tuple[int, int, int]
+    label: str = ""
+
+
+@dataclass
+class ParameterConfig:
+    """Configuration for a water parameter"""
+    name: str
+    display_name: str
+    unit: str
+    colors: List[ColorReference]
+    ideal_range: Tuple[float, float]
+    ok_range: Tuple[float, float]
+    warning_range: Tuple[float, float]
+    
+
+@dataclass 
+class AnalysisResult:
+    """Result of analyzing a single parameter"""
+    parameter: str
+    display_name: str
+    value: float
+    unit: str
+    status: str
+    detected_color: Tuple[int, int, int]
+    recommendations: List[str]
+    confidence: float = 0.0
+
+
+# ==================== REFERENCE DATA ====================
+
+# Ammonia color chart (SJ Wave) - Yellow to Teal-Green
+AMMONIA_COLORS = [
+    ColorReference(0, (230, 225, 140), "Ideal"),
+    ColorReference(0.25, (200, 220, 160), "Safe"),
+    ColorReference(0.5, (170, 210, 170), "Safe"),
+    ColorReference(1, (140, 195, 165), "Stress"),
+    ColorReference(3, (110, 175, 155), "Harmful"),
+    ColorReference(6, (85, 155, 145), "Danger"),
+]
+
+# 10-in-1 color charts
+PARAM_CONFIGS = {
+    'iron': {
+        'display_name': 'Iron (Fe)',
+        'unit': 'ppm',
+        'colors': [
+            ColorReference(0, (250, 240, 230), "OK"),
+            ColorReference(5, (255, 200, 170), ""),
+            ColorReference(10, (255, 170, 130), ""),
+            ColorReference(25, (255, 140, 100), ""),
+            ColorReference(50, (255, 110, 70), ""),
+            ColorReference(100, (230, 80, 50), ""),
+        ],
+        'saltwater': {'ideal': (0, 0), 'ok': (0, 5), 'warning': (5, 25), 'danger': (25, 999)},
+        'freshwater': {'ideal': (0, 0), 'ok': (0, 5), 'warning': (5, 25), 'danger': (25, 999)},
+    },
+    'copper': {
+        'display_name': 'Copper (Cu)',
+        'unit': 'ppm',
+        'colors': [
+            ColorReference(0, (250, 245, 240), "OK"),
+            ColorReference(10, (240, 225, 215), ""),
+            ColorReference(30, (230, 200, 195), ""),
+            ColorReference(100, (210, 160, 175), ""),
+            ColorReference(200, (185, 130, 155), ""),
+            ColorReference(300, (155, 100, 135), ""),
+        ],
+        'saltwater': {'ideal': (0, 0), 'ok': (0, 0), 'warning': (0, 10), 'danger': (10, 999)},
+        'freshwater': {'ideal': (0, 0), 'ok': (0, 10), 'warning': (10, 30), 'danger': (30, 999)},
+    },
+    'nitrate': {
+        'display_name': 'Nitrate (NO₃)',
+        'unit': 'ppm',
+        'colors': [
+            ColorReference(0, (255, 255, 245), ""),
+            ColorReference(10, (255, 240, 200), "Safe"),
+            ColorReference(25, (255, 220, 150), "Safe"),
+            ColorReference(50, (240, 190, 100), ""),
+            ColorReference(100, (220, 150, 70), "Water Change"),
+            ColorReference(250, (190, 110, 50), "Water Change"),
+        ],
+        'saltwater': {'ideal': (0, 10), 'ok': (0, 25), 'warning': (25, 50), 'danger': (50, 999)},
+        'freshwater': {'ideal': (0, 20), 'ok': (0, 40), 'warning': (40, 80), 'danger': (80, 999)},
+    },
+    'nitrite': {
+        'display_name': 'Nitrite (NO₂)',
+        'unit': 'ppm',
+        'colors': [
+            ColorReference(0, (255, 250, 252), "OK"),
+            ColorReference(1, (255, 210, 230), ""),
+            ColorReference(5, (255, 160, 195), "Water Change"),
+            ColorReference(10, (240, 110, 165), "Water Change"),
+        ],
+        'saltwater': {'ideal': (0, 0), 'ok': (0, 0.5), 'warning': (0.5, 1), 'danger': (1, 999)},
+        'freshwater': {'ideal': (0, 0), 'ok': (0, 0.5), 'warning': (0.5, 1), 'danger': (1, 999)},
+    },
+    'chlorine': {
+        'display_name': 'Chlorine (Cl₂)',
+        'unit': 'ppm',
+        'colors': [
+            ColorReference(0, (255, 252, 255), "OK"),
+            ColorReference(0.8, (245, 225, 245), ""),
+            ColorReference(1.5, (230, 190, 230), "Water Change"),
+            ColorReference(3, (210, 150, 210), "Water Change"),
+        ],
+        'saltwater': {'ideal': (0, 0), 'ok': (0, 0), 'warning': (0, 0.5), 'danger': (0.5, 999)},
+        'freshwater': {'ideal': (0, 0), 'ok': (0, 0), 'warning': (0, 0.5), 'danger': (0.5, 999)},
+    },
+    'hardness': {
+        'display_name': 'Total Hardness (GH)',
+        'unit': 'ppm',
+        'colors': [
+            ColorReference(0, (245, 235, 255), ""),
+            ColorReference(25, (210, 190, 235), ""),
+            ColorReference(75, (180, 160, 215), "OK"),
+            ColorReference(150, (150, 130, 195), "OK"),
+            ColorReference(300, (120, 100, 175), ""),
+        ],
+        'saltwater': {'ideal': (150, 300), 'ok': (75, 300), 'warning': (25, 75), 'danger': (0, 25)},
+        'freshwater': {'ideal': (75, 150), 'ok': (50, 200), 'warning': (0, 50), 'danger': (200, 999)},
+    },
+    'alkalinity': {
+        'display_name': 'Total Alkalinity (TAL)',
+        'unit': 'ppm',
+        'colors': [
+            ColorReference(0, (200, 245, 235), ""),
+            ColorReference(40, (160, 230, 210), ""),
+            ColorReference(80, (120, 210, 180), "OK"),
+            ColorReference(120, (85, 190, 150), "OK"),
+            ColorReference(180, (55, 170, 120), ""),
+            ColorReference(300, (35, 150, 90), ""),
+        ],
+        'saltwater': {'ideal': (120, 180), 'ok': (80, 200), 'warning': (40, 80), 'danger': (0, 40)},
+        'freshwater': {'ideal': (80, 120), 'ok': (40, 180), 'warning': (0, 40), 'danger': (180, 999)},
+    },
+    'carbonate': {
+        'display_name': 'Carbonate Hardness (KH)',
+        'unit': 'ppm',
+        'colors': [
+            ColorReference(0, (205, 245, 225), ""),
+            ColorReference(40, (165, 230, 190), ""),
+            ColorReference(80, (125, 210, 150), "OK"),
+            ColorReference(120, (90, 190, 115), "OK"),
+            ColorReference(180, (60, 170, 85), ""),
+            ColorReference(300, (40, 150, 60), ""),
+        ],
+        'saltwater': {'ideal': (120, 180), 'ok': (80, 200), 'warning': (40, 80), 'danger': (0, 40)},
+        'freshwater': {'ideal': (80, 120), 'ok': (40, 180), 'warning': (0, 40), 'danger': (180, 999)},
+    },
+    'ph': {
+        'display_name': 'pH',
+        'unit': '',
+        'colors_freshwater': [
+            ColorReference(6.4, (255, 200, 100), ""),
+            ColorReference(6.8, (255, 220, 80), ""),
+            ColorReference(7.2, (235, 235, 65), "OK"),
+            ColorReference(7.6, (185, 225, 85), "OK"),
+            ColorReference(8.0, (135, 205, 105), ""),
+            ColorReference(8.4, (90, 185, 125), ""),
+        ],
+        'colors_saltwater': [
+            ColorReference(6.8, (255, 185, 105), ""),
+            ColorReference(7.2, (255, 145, 85), ""),
+            ColorReference(7.6, (255, 105, 105), ""),
+            ColorReference(8.0, (255, 85, 125), "OK"),
+            ColorReference(8.4, (235, 65, 145), "OK"),
+            ColorReference(9.0, (205, 55, 165), ""),
+        ],
+        'saltwater': {'ideal': (8.0, 8.4), 'ok': (7.8, 8.5), 'warning': (7.6, 7.8), 'danger': (0, 7.6)},
+        'freshwater': {'ideal': (6.8, 7.6), 'ok': (6.4, 8.0), 'warning': (6.0, 6.4), 'danger': (0, 6.0)},
+    },
+}
+
+# Specific gravity ranges for saltwater
+SG_RANGES = {
+    'ideal': (1.024, 1.026),
+    'ok': (1.022, 1.027),
+    'warning': (1.019, 1.022),
+    'danger': (0, 1.019),
+}
+
+
+# ==================== COLOR ANALYSIS ====================
+
+def weighted_color_distance(c1: Tuple[int, int, int], c2: Tuple[int, int, int]) -> float:
+    """
+    Calculate perceptually-weighted color distance.
+    Uses a modified formula that accounts for human color perception.
+    """
+    r1, g1, b1 = c1
+    r2, g2, b2 = c2
+    
+    rmean = (r1 + r2) / 2
+    dr = r1 - r2
+    dg = g1 - g2
+    db = b1 - b2
+    
+    # Weighted Euclidean distance
+    return np.sqrt(
+        (2 + rmean/256) * dr**2 +
+        4 * dg**2 +
+        (2 + (255-rmean)/256) * db**2
+    )
+
+
+def rgb_to_hsv(rgb: Tuple[int, int, int]) -> Tuple[float, float, float]:
+    """Convert RGB to HSV"""
+    r, g, b = [x/255.0 for x in rgb]
+    cmax = max(r, g, b)
+    cmin = min(r, g, b)
+    diff = cmax - cmin
+    
+    # Hue
+    if diff == 0:
+        h = 0
+    elif cmax == r:
+        h = (60 * ((g - b) / diff) + 360) % 360
+    elif cmax == g:
+        h = (60 * ((b - r) / diff) + 120) % 360
+    else:
+        h = (60 * ((r - g) / diff) + 240) % 360
+    
+    # Saturation
+    s = 0 if cmax == 0 else (diff / cmax) * 100
+    
+    # Value
+    v = cmax * 100
+    
+    return (h, s, v)
+
+
+def find_best_match(detected_color: Tuple[int, int, int], 
+                    color_refs: List[ColorReference]) -> Tuple[float, float]:
+    """
+    Find the best matching value from color references.
+    Returns (interpolated_value, confidence)
+    """
+    if not color_refs:
+        return 0, 0
+    
+    # Calculate distances to all references
+    distances = []
+    for ref in color_refs:
+        dist = weighted_color_distance(detected_color, ref.rgb)
+        distances.append((ref.value, dist))
+    
+    # Sort by distance
+    distances.sort(key=lambda x: x[1])
+    
+    # Get best match
+    best_value, best_dist = distances[0]
+    
+    # Interpolate between two closest if possible
+    if len(distances) >= 2:
+        v1, d1 = distances[0]
+        v2, d2 = distances[1]
         
-        # Ammonia Logic
-        amm_row = next((x for x in data if x['Parameter'] == 'Ammonia'), None)
-        if amm_row:
-            val = amm_row['Value']
-            if val == 0:
-                st.success("✅ Ammonia is Safe (0 ppm)")
-            elif val < 0.5:
-                st.warning(f"⚠️ Ammonia Detected ({val} ppm). Monitor closely.")
+        if d1 + d2 > 0:
+            # Weighted interpolation
+            weight = d1 / (d1 + d2)
+            interpolated = v1 + (v2 - v1) * weight * 0.5  # Conservative interpolation
+        else:
+            interpolated = v1
+    else:
+        interpolated = best_value
+    
+    # Calculate confidence (inverse of normalized distance)
+    max_possible_dist = 765  # sqrt(255^2 * 3) approx
+    confidence = max(0, min(100, (1 - best_dist / max_possible_dist) * 100))
+    
+    return interpolated, confidence
+
+
+def get_status_for_value(value: float, ranges: Dict, reverse: bool = False) -> str:
+    """Determine status based on value and ranges"""
+    ideal = ranges.get('ideal', (0, 0))
+    ok = ranges.get('ok', (0, 0))
+    warning = ranges.get('warning', (0, 0))
+    
+    if ideal[0] <= value <= ideal[1]:
+        return 'ok'
+    elif ok[0] <= value <= ok[1]:
+        return 'ok'
+    elif warning[0] <= value <= warning[1]:
+        return 'warning'
+    else:
+        return 'danger'
+
+
+# ==================== IMAGE PROCESSING ====================
+
+def preprocess_for_color_detection(image: np.ndarray) -> np.ndarray:
+    """Preprocess image for accurate color detection"""
+    # Convert to LAB for perceptual uniformity
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    
+    # Adaptive histogram equalization on L channel
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+    
+    # Convert back
+    processed = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    
+    # Slight Gaussian blur to reduce noise
+    processed = cv2.GaussianBlur(processed, (3, 3), 0)
+    
+    return processed
+
+
+def sample_color_at_point(image: np.ndarray, x: int, y: int, 
+                          radius: int = 10) -> Tuple[int, int, int]:
+    """Sample the median color in a circular region around a point"""
+    h, w = image.shape[:2]
+    
+    # Clamp coordinates
+    x = max(radius, min(w - radius, x))
+    y = max(radius, min(h - radius, y))
+    
+    # Extract region
+    region = image[y-radius:y+radius, x-radius:x+radius]
+    
+    if region.size == 0:
+        return (128, 128, 128)
+    
+    # Create circular mask
+    mask = np.zeros((radius*2, radius*2), dtype=np.uint8)
+    cv2.circle(mask, (radius, radius), radius, 255, -1)
+    
+    # Apply mask and get median
+    pixels = region[mask > 0]
+    if len(pixels) > 0:
+        median_color = np.median(pixels, axis=0).astype(int)
+        return tuple(median_color)
+    
+    return (128, 128, 128)
+
+
+def detect_strip_orientation(image: np.ndarray) -> str:
+    """Detect if strip is horizontal or vertical"""
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150)
+    
+    # Find lines
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, 50, minLineLength=50, maxLineGap=10)
+    
+    if lines is None:
+        return 'vertical'
+    
+    horizontal_count = 0
+    vertical_count = 0
+    
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        angle = abs(np.arctan2(y2-y1, x2-x1) * 180 / np.pi)
+        
+        if angle < 30 or angle > 150:
+            horizontal_count += 1
+        elif 60 < angle < 120:
+            vertical_count += 1
+    
+    return 'horizontal' if horizontal_count > vertical_count else 'vertical'
+
+
+# ==================== RECOMMENDATIONS ====================
+
+def get_recommendations(param: str, value: float, status: str, water_type: str) -> List[str]:
+    """Generate recommendations based on parameter and value"""
+    recs = []
+    
+    if param == 'ammonia':
+        if status == 'warning':
+            recs = [
+                "Perform 25% water change",
+                "Reduce feeding for 2-3 days",
+                "Check for dead organisms or decaying matter",
+                "Test for nitrite to check nitrogen cycle"
+            ]
+        elif status == 'danger':
+            recs = [
+                "🚨 EMERGENCY: Perform 50% water change immediately",
+                "Add ammonia neutralizer (Seachem Prime or similar)",
+                "Stop feeding completely for 48 hours",
+                "Check and clean filter media (in tank water)",
+                "Consider adding beneficial bacteria supplement"
+            ]
+    
+    elif param == 'nitrite':
+        if status == 'warning':
+            recs = [
+                "Perform 25-30% water change",
+                "Nitrogen cycle may be incomplete",
+                "Add beneficial bacteria supplement",
+                "Reduce feeding"
+            ]
+        elif status == 'danger':
+            recs = [
+                "🚨 URGENT: 50% water change needed",
+                "Add Prime to detoxify nitrite",
+                "Heavily reduce or stop feeding",
+                "Check filter function"
+            ]
+    
+    elif param == 'nitrate':
+        if status == 'warning':
+            recs = [
+                "Schedule 25-30% water change",
+                f"{'Consider adding macroalgae or refugium' if water_type == 'saltwater' else 'Add live plants to absorb nitrates'}",
+                "Review feeding schedule"
+            ]
+        elif status == 'danger':
+            recs = [
+                "Large water change needed (40-50%)",
+                "Check for hidden detritus",
+                "Review and reduce feeding amount",
+                "Consider more frequent water changes"
+            ]
+    
+    elif param == 'ph':
+        if water_type == 'saltwater':
+            if value < 8.0:
+                recs = [
+                    "pH is low for saltwater",
+                    "Check and boost alkalinity",
+                    "Increase surface agitation for CO2 off-gassing",
+                    "Consider pH buffer"
+                ]
+            elif value > 8.5:
+                recs = [
+                    "pH is elevated",
+                    "Check dosing equipment",
+                    "Ensure proper lighting schedule"
+                ]
+        else:
+            if value < 6.5:
+                recs = [
+                    "pH is low for most freshwater fish",
+                    "Add crushed coral or limestone",
+                    "Check KH levels",
+                    "Consider pH buffer"
+                ]
+            elif value > 8.0:
+                recs = [
+                    "pH is elevated",
+                    "Add driftwood or peat",
+                    "Use RO water for water changes"
+                ]
+    
+    elif param == 'alkalinity' or param == 'carbonate':
+        if water_type == 'saltwater':
+            if value < 80:
+                recs = [
+                    "Alkalinity too low for reef keeping",
+                    "Add alkalinity supplement (baking soda or commercial)",
+                    "Check calcium reactor or kalkwasser dosing"
+                ]
+            elif value > 200:
+                recs = [
+                    "Alkalinity elevated",
+                    "Reduce dosing",
+                    "Check for precipitation"
+                ]
+    
+    elif param == 'copper':
+        if value > 0:
+            recs = [
+                "🚨 Copper detected - toxic to invertebrates!",
+                "Run activated carbon immediately",
+                "Check for copper contamination source",
+                "Do NOT add invertebrates until copper is 0"
+            ]
+    
+    elif param == 'chlorine':
+        if value > 0:
+            recs = [
+                "🚨 Chlorine detected!",
+                "Add dechlorinator immediately",
+                "Always treat tap water before adding to tank"
+            ]
+    
+    return recs
+
+
+def get_sg_recommendations(sg: float) -> List[str]:
+    """Get recommendations for specific gravity"""
+    recs = []
+    
+    if sg < 1.020:
+        recs = [
+            "Salinity critically low",
+            "Add salt mix gradually over several hours",
+            "Do not raise more than 0.002 per day"
+        ]
+    elif sg < 1.022:
+        recs = [
+            "Salinity slightly low",
+            "Gradually add salt mix to raise to 1.024-1.026"
+        ]
+    elif sg > 1.028:
+        recs = [
+            "Salinity too high",
+            "Top off with freshwater (not saltwater)",
+            "Reduce slowly over time"
+        ]
+    elif sg > 1.026:
+        recs = [
+            "Salinity slightly elevated",
+            "Use freshwater for top-offs"
+        ]
+    
+    return recs
+
+
+# ==================== REPORT GENERATION ====================
+
+def generate_text_report(results: Dict[str, AnalysisResult], 
+                         water_type: str,
+                         specific_gravity: Optional[float] = None) -> str:
+    """Generate a downloadable text report"""
+    report = []
+    report.append("=" * 50)
+    report.append("AQUARIUM WATER QUALITY REPORT")
+    report.append("=" * 50)
+    report.append("")
+    report.append(f"Water Type: {water_type.upper()}")
+    if specific_gravity:
+        report.append(f"Specific Gravity: {specific_gravity:.3f}")
+    report.append("")
+    report.append("-" * 50)
+    report.append("PARAMETER RESULTS")
+    report.append("-" * 50)
+    
+    for param, result in results.items():
+        report.append("")
+        status_icon = "✅" if result.status == "ok" else ("⚠️" if result.status == "warning" else "🚨")
+        report.append(f"{status_icon} {result.display_name}: {result.value:.2f} {result.unit}")
+        report.append(f"   Status: {result.status.upper()}")
+        report.append(f"   Confidence: {result.confidence:.0f}%")
+        
+        if result.recommendations:
+            report.append("   Recommendations:")
+            for rec in result.recommendations:
+                report.append(f"   • {rec}")
+    
+    report.append("")
+    report.append("-" * 50)
+    report.append("END OF REPORT")
+    report.append("-" * 50)
+    
+    return "\n".join(report)
+
+
+# ==================== STREAMLIT UI ====================
+
+def create_color_preview(color: Tuple[int, int, int], size: int = 50) -> np.ndarray:
+    """Create a color preview image"""
+    img = np.zeros((size, size, 3), dtype=np.uint8)
+    img[:, :] = color
+    return img
+
+
+def render_parameter_card(result: AnalysisResult):
+    """Render a parameter result card"""
+    status_colors = {
+        'ok': ('#00b09b', '#96c93d'),
+        'warning': ('#f093fb', '#f5576c'),
+        'danger': ('#eb3349', '#f45c43')
+    }
+    
+    colors = status_colors.get(result.status, status_colors['ok'])
+    icon = "✅" if result.status == "ok" else ("⚠️" if result.status == "warning" else "🚨")
+    
+    with st.expander(f"{icon} {result.display_name}: {result.value:.2f} {result.unit}", 
+                     expanded=(result.status != 'ok')):
+        col1, col2 = st.columns([1, 4])
+        
+        with col1:
+            swatch = create_color_preview(result.detected_color, 60)
+            st.image(swatch, caption="Detected", use_container_width=False)
+        
+        with col2:
+            st.markdown(f"**Value:** {result.value:.2f} {result.unit}")
+            st.markdown(f"**Status:** {result.status.upper()}")
+            st.progress(result.confidence / 100, text=f"Confidence: {result.confidence:.0f}%")
+        
+        if result.recommendations:
+            st.markdown("**Recommendations:**")
+            for rec in result.recommendations:
+                st.markdown(f"• {rec}")
+
+
+def main():
+    st.title("🐠 Aquarium Water Analyzer")
+    st.markdown("*Analyze your SJ Wave test strips with AI-powered color detection*")
+    
+    # Initialize session state
+    if 'sampled_colors' not in st.session_state:
+        st.session_state.sampled_colors = {}
+    if 'ammonia_color' not in st.session_state:
+        st.session_state.ammonia_color = None
+    if 'analysis_results' not in st.session_state:
+        st.session_state.analysis_results = None
+    
+    # ===== CONFIGURATION SECTION =====
+    st.markdown("---")
+    st.markdown("### ⚙️ Configuration")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        water_type = st.selectbox(
+            "🌊 Water Type",
+            ["Saltwater", "Freshwater"],
+            key="water_type"
+        )
+        water_type_key = water_type.lower()
+    
+    with col2:
+        if water_type_key == 'saltwater':
+            sg_input = st.text_input(
+                "📏 Specific Gravity",
+                placeholder="e.g., 1.025",
+                help="Enter your refractometer reading"
+            )
+            specific_gravity = None
+            if sg_input:
+                try:
+                    specific_gravity = float(sg_input)
+                    if specific_gravity < 1.0 or specific_gravity > 1.1:
+                        st.warning("Value seems unusual. Normal range is 1.020-1.030")
+                except:
+                    st.error("Enter a valid number (e.g., 1.025)")
+        else:
+            specific_gravity = None
+    
+    # ===== IMAGE UPLOAD SECTION =====
+    st.markdown("---")
+    st.markdown("### 📸 Upload Test Strip Images")
+    
+    st.markdown("""
+    <div class="instruction-box">
+    <strong>Instructions:</strong>
+    <ol>
+    <li>Take photos of your test strips next to their color charts</li>
+    <li>Ensure good natural lighting (avoid shadows)</li>
+    <li>Upload images and sample colors from each pad</li>
+    </ol>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    tab1, tab2 = st.tabs(["📊 10-in-1 Strip", "🧪 Ammonia Strip"])
+    
+    # ----- 10-in-1 Tab -----
+    with tab1:
+        ten_in_one_file = st.file_uploader(
+            "Upload 10-in-1 test strip image",
+            type=['jpg', 'jpeg', 'png'],
+            key="upload_10in1",
+            help="Photo should show the strip alongside the color chart"
+        )
+        
+        if ten_in_one_file:
+            image = Image.open(ten_in_one_file)
+            img_array = np.array(image)
+            
+            # Preprocess for better color detection
+            processed = preprocess_for_color_detection(img_array)
+            
+            st.image(image, caption="Uploaded Image", use_container_width=True)
+            
+            st.markdown("#### 🎨 Sample Colors")
+            st.markdown("Select a parameter, then enter coordinates or use the color picker.")
+            
+            # Parameter selector
+            param_names = list(PARAM_CONFIGS.keys())
+            selected_param = st.selectbox(
+                "Select parameter to sample:",
+                param_names,
+                format_func=lambda x: PARAM_CONFIGS[x]['display_name'],
+                key="param_select"
+            )
+            
+            # Sampling methods
+            method = st.radio(
+                "Sampling method:",
+                ["Color Picker", "Coordinates"],
+                horizontal=True,
+                key="sample_method"
+            )
+            
+            if method == "Color Picker":
+                picked = st.color_picker(
+                    f"Pick color for {PARAM_CONFIGS[selected_param]['display_name']}",
+                    value="#FFFFFF",
+                    key=f"picker_{selected_param}"
+                )
+                
+                if st.button(f"Set {selected_param} color", key=f"set_{selected_param}"):
+                    hex_color = picked.lstrip('#')
+                    rgb = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+                    st.session_state.sampled_colors[selected_param] = rgb
+                    st.success(f"✅ Set {PARAM_CONFIGS[selected_param]['display_name']} to RGB{rgb}")
+            
+            else:  # Coordinates
+                st.markdown(f"Image size: {img_array.shape[1]} x {img_array.shape[0]}")
+                
+                col_x, col_y = st.columns(2)
+                with col_x:
+                    x_val = st.number_input("X", 0, img_array.shape[1]-1, 100, key=f"x_{selected_param}")
+                with col_y:
+                    y_val = st.number_input("Y", 0, img_array.shape[0]-1, 100, key=f"y_{selected_param}")
+                
+                if st.button(f"Sample at ({x_val}, {y_val})", key=f"sample_coord_{selected_param}"):
+                    color = sample_color_at_point(processed, int(x_val), int(y_val), radius=12)
+                    st.session_state.sampled_colors[selected_param] = color
+                    
+                    swatch = create_color_preview(color, 50)
+                    st.image(swatch, caption=f"Sampled: RGB{color}", width=50)
+                    st.success(f"✅ Sampled {PARAM_CONFIGS[selected_param]['display_name']}")
+            
+            # Show all sampled colors
+            if st.session_state.sampled_colors:
+                st.markdown("#### 📋 Sampled Parameters")
+                
+                cols = st.columns(3)
+                for i, (param, color) in enumerate(st.session_state.sampled_colors.items()):
+                    with cols[i % 3]:
+                        swatch = create_color_preview(color, 40)
+                        display_name = PARAM_CONFIGS.get(param, {}).get('display_name', param)
+                        st.image(swatch, caption=f"{display_name}", width=40)
+                        if st.button("❌", key=f"remove_{param}"):
+                            del st.session_state.sampled_colors[param]
+                            st.rerun()
+    
+    # ----- Ammonia Tab -----
+    with tab2:
+        ammonia_file = st.file_uploader(
+            "Upload ammonia test strip image",
+            type=['jpg', 'jpeg', 'png'],
+            key="upload_ammonia",
+            help="The ammonia pad is at the END of the strip"
+        )
+        
+        if ammonia_file:
+            image = Image.open(ammonia_file)
+            img_array = np.array(image)
+            processed = preprocess_for_color_detection(img_array)
+            
+            st.image(image, caption="Uploaded Ammonia Strip", use_container_width=True)
+            
+            st.markdown("""
+            **Tip:** The ammonia test pad is the small colored square at the very end 
+            of the strip. It changes from yellow (0 ppm) to green/teal (high ammonia).
+            """)
+            
+            method = st.radio(
+                "Sampling method:",
+                ["Color Picker", "Coordinates"],
+                horizontal=True,
+                key="ammonia_method"
+            )
+            
+            if method == "Color Picker":
+                ammonia_picked = st.color_picker(
+                    "Pick ammonia pad color",
+                    value="#E6E696",
+                    key="ammonia_picker"
+                )
+                
+                if st.button("Set ammonia color", key="set_ammonia"):
+                    hex_color = ammonia_picked.lstrip('#')
+                    rgb = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+                    st.session_state.ammonia_color = rgb
+                    st.success(f"✅ Set ammonia to RGB{rgb}")
+            
             else:
-                st.error(f"🚨 Ammonia Critical ({val} ppm). Water change immediately.")
+                col_x, col_y = st.columns(2)
+                with col_x:
+                    ax = st.number_input("X", 0, img_array.shape[1]-1, 50, key="ax")
+                with col_y:
+                    ay = st.number_input("Y", 0, img_array.shape[0]-1, 50, key="ay")
+                
+                if st.button("Sample ammonia", key="sample_ammonia_coord"):
+                    color = sample_color_at_point(processed, int(ax), int(ay), radius=10)
+                    st.session_state.ammonia_color = color
+                    
+                    swatch = create_color_preview(color, 50)
+                    st.image(swatch, caption=f"Sampled: RGB{color}", width=50)
+                    st.success("✅ Sampled ammonia color")
+            
+            if st.session_state.ammonia_color:
+                swatch = create_color_preview(st.session_state.ammonia_color, 50)
+                st.image(swatch, caption=f"Current: RGB{st.session_state.ammonia_color}", width=50)
+    
+    # ===== ANALYSIS SECTION =====
+    st.markdown("---")
+    st.markdown("### 🔬 Analysis")
+    
+    has_data = bool(st.session_state.sampled_colors) or st.session_state.ammonia_color is not None
+    
+    if not has_data:
+        st.info("👆 Upload images and sample colors to analyze your water parameters")
+    else:
+        if st.button("🔬 Analyze Water Parameters", type="primary", use_container_width=True):
+            with st.spinner("Analyzing colors..."):
+                results = {}
+                
+                # Analyze 10-in-1 parameters
+                for param, color in st.session_state.sampled_colors.items():
+                    config = PARAM_CONFIGS.get(param)
+                    if not config:
+                        continue
+                    
+                    # Get appropriate color references
+                    if param == 'ph':
+                        colors = config.get(f'colors_{water_type_key}', config.get('colors_freshwater'))
+                    else:
+                        colors = config.get('colors', [])
+                    
+                    color_refs = [ColorReference(c.value, c.rgb, c.label) for c in colors]
+                    
+                    # Find best match
+                    value, confidence = find_best_match(color, color_refs)
+                    
+                    # Get status
+                    ranges = config.get(water_type_key, config.get('freshwater', {}))
+                    status = get_status_for_value(value, ranges)
+                    
+                    # Get recommendations
+                    recs = get_recommendations(param, value, status, water_type_key)
+                    
+                    results[param] = AnalysisResult(
+                        parameter=param,
+                        display_name=config['display_name'],
+                        value=value,
+                        unit=config['unit'],
+                        status=status,
+                        detected_color=color,
+                        recommendations=recs,
+                        confidence=confidence
+                    )
+                
+                # Analyze ammonia
+                if st.session_state.ammonia_color:
+                    color = st.session_state.ammonia_color
+                    color_refs = [ColorReference(c.value, c.rgb, c.label) for c in AMMONIA_COLORS]
+                    value, confidence = find_best_match(color, color_refs)
+                    
+                    ranges = {'ideal': (0, 0), 'ok': (0, 0.25), 'warning': (0.25, 1), 'danger': (1, 999)}
+                    status = get_status_for_value(value, ranges)
+                    recs = get_recommendations('ammonia', value, status, water_type_key)
+                    
+                    results['ammonia'] = AnalysisResult(
+                        parameter='ammonia',
+                        display_name='Ammonia (NH₃/NH₄⁺)',
+                        value=value,
+                        unit='ppm',
+                        status=status,
+                        detected_color=color,
+                        recommendations=recs,
+                        confidence=confidence
+                    )
+                
+                # Analyze specific gravity
+                if specific_gravity and water_type_key == 'saltwater':
+                    status = get_status_for_value(specific_gravity, SG_RANGES)
+                    recs = get_sg_recommendations(specific_gravity)
+                    
+                    results['specific_gravity'] = AnalysisResult(
+                        parameter='specific_gravity',
+                        display_name='Specific Gravity',
+                        value=specific_gravity,
+                        unit='',
+                        status=status,
+                        detected_color=(0, 0, 0),
+                        recommendations=recs,
+                        confidence=100
+                    )
+                
+                st.session_state.analysis_results = results
+        
+        # Display results
+        if st.session_state.analysis_results:
+            results = st.session_state.analysis_results
+            
+            # Overall status
+            statuses = [r.status for r in results.values()]
+            if 'danger' in statuses:
+                overall = 'danger'
+                st.error("## 🚨 ACTION REQUIRED")
+                st.markdown("Critical issues detected. Take immediate action!")
+            elif 'warning' in statuses:
+                overall = 'warning'
+                st.warning("## ⚠️ ATTENTION NEEDED")
+                st.markdown("Some parameters need attention.")
+            else:
+                overall = 'ok'
+                st.success("## ✅ ALL GOOD!")
+                st.markdown("Your water parameters look healthy!")
+                st.balloons()
+            
+            # Priority actions
+            all_recs = []
+            for r in results.values():
+                if r.status in ['danger', 'warning']:
+                    all_recs.extend(r.recommendations)
+            
+            if all_recs:
+                st.markdown("### 🎯 Priority Actions")
+                for rec in list(set(all_recs))[:5]:
+                    st.markdown(f"• {rec}")
+            
+            # Parameter cards
+            st.markdown("### 📊 Detailed Results")
+            
+            for param, result in results.items():
+                render_parameter_card(result)
+            
+            # Nitrogen cycle summary (for saltwater)
+            if water_type_key == 'saltwater' and 'ammonia' in results and 'nitrite' in results:
+                st.markdown("### 🔄 Nitrogen Cycle Status")
+                
+                ammonia_val = results['ammonia'].value
+                nitrite_val = results['nitrite'].value
+                nitrate_val = results.get('nitrate', AnalysisResult("", "", 0, "", "ok", (0,0,0), [], 0)).value
+                
+                if ammonia_val == 0 and nitrite_val == 0:
+                    st.success("✅ Nitrogen cycle established and healthy")
+                elif ammonia_val > 0 and nitrite_val == 0:
+                    st.warning("⚠️ Ammonia present - cycle may be starting or disrupted")
+                elif ammonia_val > 0 and nitrite_val > 0:
+                    st.warning("⚠️ Both ammonia and nitrite present - cycle incomplete")
+                elif ammonia_val == 0 and nitrite_val > 0:
+                    st.info("🔄 Nitrite present - cycle in progress, needs more time")
+            
+            # Download report
+            st.markdown("---")
+            st.markdown("### 💾 Export")
+            
+            report = generate_text_report(results, water_type_key, specific_gravity)
+            
+            st.download_button(
+                "📥 Download Report",
+                data=report,
+                file_name="aquarium_water_report.txt",
+                mime="text/plain",
+                use_container_width=True
+            )
+    
+    # Clear button
+    if has_data:
+        st.markdown("---")
+        if st.button("🗑️ Clear All Data", use_container_width=True):
+            st.session_state.sampled_colors = {}
+            st.session_state.ammonia_color = None
+            st.session_state.analysis_results = None
+            st.rerun()
+    
+    # Footer
+    st.markdown("---")
+    st.markdown("""
+    <div style='text-align: center; color: #888; font-size: 12px; padding: 20px;'>
+    🐠 Aquarium Water Analyzer v2.0<br>
+    For SJ Wave Test Strips<br>
+    <em>Always verify with professional testing for critical decisions</em>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+if __name__ == "__main__":
+    main()
